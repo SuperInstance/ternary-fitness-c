@@ -3,138 +3,253 @@
 #include <math.h>
 #include <string.h>
 #include <float.h>
+#include <stdlib.h>
 
-double tf_strategy_fitness(const tf_strategy_t *s, const tf_environment_t *env) {
-    double total = 0.0;
-    size_t limit = s->len < env->n_states ? s->len : env->n_states;
-    for (size_t i = 0; i < limit; i++) {
-        int idx = (int)s->actions[i] + 1; /* -1→0, 0→1, 1→2 */
-        if (idx >= 0 && idx < 3) {
-            total += env->rewards[i][idx];
-        }
-    }
-    return total;
-}
+/* ---- Internal helpers ---- */
 
-int tf_strategy_active_count(const tf_strategy_t *s) {
-    int count = 0;
-    for (size_t i = 0; i < s->len; i++) {
-        if (s->actions[i] == TF_CHOOSE) count++;
-    }
-    return count;
-}
-
-double tf_shannon_entropy(const tf_strategy_t *s) {
-    int counts[3] = {0, 0, 0};
-    for (size_t i = 0; i < s->len; i++) {
-        int idx = (int)s->actions[i] + 1;
-        if (idx >= 0 && idx < 3) counts[idx]++;
-    }
-    double h = 0.0;
-    double total = (double)s->len;
-    for (int i = 0; i < 3; i++) {
-        if (counts[i] > 0) {
-            double p = counts[i] / total;
-            h -= p * log2(p);
-        }
-    }
-    return h;
-}
-
-double tf_normalized_entropy(const tf_strategy_t *s) {
-    if (s->len == 0) return 0.0;
-    double h = tf_shannon_entropy(s);
-    double max_h = log2(3.0); /* 3 outcomes */
-    return h / max_h;
-}
-
-double tf_hamming_distance(const tf_strategy_t *a, const tf_strategy_t *b) {
+/* Hamming distance between two genomes (matching length only) */
+static size_t hamming_dist(const tf_genome_t *a, const tf_genome_t *b) {
     size_t min_len = a->len < b->len ? a->len : b->len;
-    double dist = 0.0;
+    size_t d = 0;
     for (size_t i = 0; i < min_len; i++) {
-        if (a->actions[i] != b->actions[i]) dist += 1.0;
+        if (a->genes[i] != b->genes[i]) d++;
     }
-    /* Extra length counts as differences */
-    dist += (double)((a->len > b->len ? a->len : b->len) - min_len);
-    return dist;
+    d += (a->len > b->len ? a->len : b->len) - min_len;
+    return d;
 }
 
-static void int_to_ternary(int val, size_t n, tf_strategy_t *s) {
-    s->len = n;
-    for (size_t i = 0; i < n; i++) {
-        int digit = val % 3;
-        val /= 3;
-        s->actions[i] = (tf_action_t)(digit - 1); /* 0→-1, 1→0, 2→1 */
-    }
-}
+/* ---- FitnessFunction ---- */
 
-size_t tf_exhaustive_search(size_t n, const tf_environment_t *env, tf_search_result_t *result) {
-    /* Total strategies = 3^n */
-    size_t total = 1;
-    for (size_t i = 0; i < n; i++) {
-        total *= 3;
-        if (total > TF_MAX_STRATEGIES) {
-            total = TF_MAX_STRATEGIES;
-            break;
+double tf_fitness_match(const tf_genome_t *genome,
+                        const tf_genome_t *target,
+                        const double *weights) {
+    if (genome->len == 0) return 0.0;
+    size_t min_len = genome->len < target->len ? genome->len : target->len;
+    double score = 0.0;
+    double w_total = 0.0;
+    for (size_t i = 0; i < min_len; i++) {
+        double w = weights ? weights[i] : 1.0;
+        if (genome->genes[i] == target->genes[i]) {
+            score += w;
         }
+        w_total += w;
     }
-    
-    result->count = 0;
-    for (size_t i = 0; i < total; i++) {
-        int_to_ternary((int)i, n, &result->strategies[i]);
-        result->fitnesses[i] = tf_strategy_fitness(&result->strategies[i], env);
-        result->count++;
-    }
-    return result->count;
+    return w_total > 0.0 ? score / w_total : 0.0;
 }
 
-int tf_find_best(const tf_search_result_t *result, tf_strategy_t *best, double *best_fitness) {
-    if (result->count == 0) return 0;
-    
-    *best_fitness = -DBL_MAX;
-    size_t best_idx = 0;
-    for (size_t i = 0; i < result->count; i++) {
-        if (result->fitnesses[i] > *best_fitness) {
-            *best_fitness = result->fitnesses[i];
-            best_idx = i;
-        }
-    }
-    *best = result->strategies[best_idx];
-    return 1;
+double tf_fitness_hamming(const tf_genome_t *genome,
+                          const tf_genome_t *target,
+                          const double *weights) {
+    if (genome->len == 0) return 0.0;
+    size_t d = hamming_dist(genome, target);
+    return 1.0 - (double)d / (double)(genome->len > target->len ? genome->len : target->len);
 }
 
-tf_landscape_info_t tf_analyze_landscape(const tf_search_result_t *result) {
-    tf_landscape_info_t info = {0, 0, -DBL_MAX, DBL_MAX, 0.0};
-    if (result->count == 0) return info;
-    
+/* ---- PopulationFitness ---- */
+
+void tf_population_fitness(const tf_genome_t *pop, size_t pop_size,
+                           const tf_genome_t *target,
+                           const double *weights,
+                           tf_fitness_fn fn,
+                           tf_pop_fitness_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (pop_size == 0) return;
+
+    out->count = pop_size;
+    out->total = 0.0;
+    out->min = DBL_MAX;
+    out->max = -DBL_MAX;
+    out->best_idx = 0;
+    out->worst_idx = 0;
+
+    for (size_t i = 0; i < pop_size; i++) {
+        double f = fn(&pop[i], target, weights);
+        out->fitnesses[i] = f;
+        out->total += f;
+        if (f > out->max) { out->max = f; out->best_idx = i; }
+        if (f < out->min) { out->min = f; out->worst_idx = i; }
+    }
+    out->mean = out->total / (double)pop_size;
+}
+
+/* ---- FitnessLandscape ---- */
+
+void tf_landscape_init(tf_landscape_t *land) {
+    memset(land, 0, sizeof(*land));
+    land->base_fitness_scale = 1.0;
+}
+
+void tf_landscape_add_peak(tf_landscape_t *land,
+                           const tf_genome_t *genome,
+                           double bonus, double sigma) {
+    if (land->n_peaks >= TF_MAX_PEAKS) return;
+    land->peaks[land->n_peaks].genome = *genome;
+    land->peaks[land->n_peaks].bonus = bonus;
+    land->peaks[land->n_peaks].sigma = sigma > 0.0 ? sigma : 1.0;
+    land->n_peaks++;
+}
+
+void tf_landscape_add_valley(tf_landscape_t *land,
+                             const tf_genome_t *genome,
+                             double penalty, double sigma) {
+    if (land->n_valleys >= TF_MAX_VALLEYS) return;
+    land->valleys[land->n_valleys].genome = *genome;
+    land->valleys[land->n_valleys].penalty = penalty;
+    land->valleys[land->n_valleys].sigma = sigma > 0.0 ? sigma : 1.0;
+    land->n_valleys++;
+}
+
+double tf_landscape_fitness(const tf_landscape_t *land,
+                            const tf_genome_t *genome,
+                            const tf_genome_t *target,
+                            const double *weights) {
+    /* Start with base matching fitness */
+    double base = tf_fitness_match(genome, target, weights);
+    double fitness = base * land->base_fitness_scale;
+
+    /* Add peak bonuses (Gaussian decay) */
+    for (size_t i = 0; i < land->n_peaks; i++) {
+        double d = (double)hamming_dist(genome, &land->peaks[i].genome);
+        double sigma = land->peaks[i].sigma;
+        fitness += land->peaks[i].bonus * exp(-(d * d) / (2.0 * sigma * sigma));
+    }
+
+    /* Subtract valley penalties (Gaussian decay) */
+    for (size_t i = 0; i < land->n_valleys; i++) {
+        double d = (double)hamming_dist(genome, &land->valleys[i].genome);
+        double sigma = land->valleys[i].sigma;
+        fitness -= land->valleys[i].penalty * exp(-(d * d) / (2.0 * sigma * sigma));
+    }
+
+    return fitness;
+}
+
+/* ---- SelectionPressure ---- */
+
+double tf_apply_pressure(const tf_pop_fitness_t *raw,
+                         tf_selection_pressure_t sp,
+                         double *scaled) {
+    if (raw->count == 0) return 0.0;
+
     double sum = 0.0;
-    for (size_t i = 0; i < result->count; i++) {
-        double f = result->fitnesses[i];
-        sum += f;
-        if (f > info.max_fitness) info.max_fitness = f;
-        if (f < info.min_fitness) info.min_fitness = f;
+
+    switch (sp.method) {
+    case TF_PRESSURE_RANK: {
+        /* Sort indices by fitness descending to assign ranks */
+        size_t n = raw->count;
+        /* Build index array */
+        size_t *idx = (size_t *)malloc(n * sizeof(size_t));
+        for (size_t i = 0; i < n; i++) idx[i] = i;
+
+        /* Simple insertion sort */
+        for (size_t i = 1; i < n; i++) {
+            size_t key = idx[i];
+            size_t j = i;
+            while (j > 0 && raw->fitnesses[idx[j-1]] < raw->fitnesses[key]) {
+                idx[j] = idx[j-1];
+                j--;
+            }
+            idx[j] = key;
+        }
+
+        /* k = param (selection intensity), default 2.0 */
+        double k = sp.param > 0.0 ? sp.param : 2.0;
+        for (size_t rank = 0; rank < n; rank++) {
+            double sv = k - ((double)rank / (n > 1 ? (double)(n - 1) : 1.0)) * (k - 1.0);
+            scaled[idx[rank]] = sv;
+            sum += sv;
+        }
+        free(idx);
+        break;
     }
-    info.mean_fitness = sum / (double)result->count;
-    
-    /* Count peaks: strategies with fitness above mean */
-    for (size_t i = 0; i < result->count; i++) {
-        double f = result->fitnesses[i];
-        if (f > info.mean_fitness) info.n_peaks++;
+    case TF_PRESSURE_EXPONENTIAL: {
+        double s = sp.param != 0.0 ? sp.param : 1.0;
+        for (size_t i = 0; i < raw->count; i++) {
+            scaled[i] = exp(s * raw->fitnesses[i]);
+            sum += scaled[i];
+        }
+        break;
     }
-    
-    info.n_basins = result->count - info.n_peaks;
-    return info;
+    case TF_PRESSURE_SIGMA: {
+        /* Compute stddev */
+        double var = 0.0;
+        for (size_t i = 0; i < raw->count; i++) {
+            double diff = raw->fitnesses[i] - raw->mean;
+            var += diff * diff;
+        }
+        double stddev = sqrt(var / (double)raw->count);
+        for (size_t i = 0; i < raw->count; i++) {
+            if (stddev > 1e-12) {
+                scaled[i] = 1.0 + (raw->fitnesses[i] - raw->mean) / (2.0 * stddev);
+            } else {
+                scaled[i] = 1.0;
+            }
+            if (scaled[i] < 0.0) scaled[i] = 0.0; /* floor at 0 */
+            sum += scaled[i];
+        }
+        break;
+    }
+    case TF_PRESSURE_POWER: {
+        double pw = sp.param > 0.0 ? sp.param : 2.0;
+        for (size_t i = 0; i < raw->count; i++) {
+            double base = raw->fitnesses[i] > 0.0 ? raw->fitnesses[i] : 0.0;
+            scaled[i] = pow(base, pw);
+            sum += scaled[i];
+        }
+        break;
+    }
+    }
+
+    return sum;
 }
 
-double tf_population_diversity(const tf_strategy_t *pop, size_t n) {
-    if (n < 2) return 0.0;
-    double total_dist = 0.0;
-    size_t pairs = 0;
-    for (size_t i = 0; i < n; i++) {
-        for (size_t j = i + 1; j < n; j++) {
-            total_dist += tf_hamming_distance(&pop[i], &pop[j]);
-            pairs++;
-        }
+/* ---- Elitism ---- */
+
+/* Comparison for qsort */
+typedef struct {
+    double fitness;
+    size_t idx;
+} _fit_idx_t;
+
+static int _fit_cmp(const void *a, const void *b) {
+    double fa = ((const _fit_idx_t *)a)->fitness;
+    double fb = ((const _fit_idx_t *)b)->fitness;
+    if (fb > fa) return 1;
+    if (fb < fa) return -1;
+    return 0;
+}
+
+size_t tf_elitism(const tf_pop_fitness_t *pop_fitness,
+                  const tf_genome_t *pop, size_t pop_size,
+                  size_t n_elite,
+                  tf_genome_t *elite_out, double *elite_fitness_out) {
+    size_t n = n_elite < pop_size ? n_elite : pop_size;
+    if (n == 0) return 0;
+
+    _fit_idx_t *fi = (_fit_idx_t *)malloc(pop_size * sizeof(_fit_idx_t));
+    for (size_t i = 0; i < pop_size; i++) {
+        fi[i].fitness = pop_fitness->fitnesses[i];
+        fi[i].idx = i;
     }
-    return pairs > 0 ? total_dist / (double)pairs : 0.0;
+    qsort(fi, pop_size, sizeof(_fit_idx_t), _fit_cmp);
+
+    for (size_t i = 0; i < n; i++) {
+        elite_out[i] = pop[fi[i].idx];
+        if (elite_fitness_out) elite_fitness_out[i] = fi[i].fitness;
+    }
+    free(fi);
+    return n;
+}
+
+void tf_sort_by_fitness(const tf_pop_fitness_t *pf, size_t *indices, size_t n) {
+    _fit_idx_t *fi = (_fit_idx_t *)malloc(n * sizeof(_fit_idx_t));
+    for (size_t i = 0; i < n; i++) {
+        fi[i].fitness = pf->fitnesses[i];
+        fi[i].idx = i;
+    }
+    qsort(fi, n, sizeof(_fit_idx_t), _fit_cmp);
+    for (size_t i = 0; i < n; i++) {
+        indices[i] = fi[i].idx;
+    }
+    free(fi);
 }

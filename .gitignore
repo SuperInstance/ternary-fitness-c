@@ -1,1 +1,5 @@
+*.o
 test_fitness
+.env
+credentials.*
+*.secret

@@ -1,204 +1,358 @@
 /* Tests for ternary-fitness-c */
 #include <stdio.h>
 #include <stdlib.h>
-#include <assert.h>
+#include <string.h>
 #include <math.h>
 #include "../src/ternary_fitness.h"
 
-#define ASSERT_FEQ(a, b, tol) do { \
-    if (fabs((a) - (b)) > (tol)) { \
-        fprintf(stderr, "FAIL %s:%d: %f != %f\n", __FILE__, __LINE__, (double)(a), (double)(b)); \
+#define ASSERT(cond) do { \
+    if (!(cond)) { \
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
         return 1; \
     } \
 } while(0)
 
-int test_strategy_fitness() {
-    tf_strategy_t s = {.len = 4, .actions = {TF_CHOOSE, TF_CHOOSE, TF_CHOOSE, TF_CHOOSE}};
-    tf_environment_t env = {.n_states = 4};
-    for (int i = 0; i < 4; i++) {
-        env.rewards[i][0] = -1.0; /* avoid */
-        env.rewards[i][1] =  0.0; /* unknown */
-        env.rewards[i][2] =  1.0; /* choose */
-    }
-    double f = tf_strategy_fitness(&s, &env);
-    ASSERT_FEQ(f, 4.0, 0.001);
+#define ASSERT_FEQ(a, b, tol) do { \
+    if (fabs((a) - (b)) > (tol)) { \
+        fprintf(stderr, "FAIL %s:%d: %f != %f (tol %g)\n", \
+                __FILE__, __LINE__, (double)(a), (double)(b), (double)(tol)); \
+        return 1; \
+    } \
+} while(0)
+
+/* Helper: build a genome from an array of ints */
+static tf_genome_t make_genome(const int *vals, size_t n) {
+    tf_genome_t g;
+    g.len = n;
+    for (size_t i = 0; i < n; i++) g.genes[i] = (tf_ternary_t)vals[i];
+    return g;
+}
+
+/* ---- Test 1: FitnessFunction — perfect match ---- */
+int test_fitness_perfect_match(void) {
+    int v[] = {1, -1, 0, 1};
+    tf_genome_t genome = make_genome(v, 4);
+    tf_genome_t target = make_genome(v, 4);
+    double f = tf_fitness_match(&genome, &target, NULL);
+    ASSERT_FEQ(f, 1.0, 0.001);
     return 0;
 }
 
-int test_strategy_fitness_mixed() {
-    tf_strategy_t s = {.len = 3, .actions = {TF_AVOID, TF_UNKNOWN, TF_CHOOSE}};
-    tf_environment_t env = {.n_states = 3};
-    for (int i = 0; i < 3; i++) {
-        env.rewards[i][0] = -1.0;
-        env.rewards[i][1] = 0.5;
-        env.rewards[i][2] = 1.0;
-    }
-    double f = tf_strategy_fitness(&s, &env);
-    ASSERT_FEQ(f, 0.5, 0.001); /* -1 + 0.5 + 1 = 0.5 */
+/* ---- Test 2: FitnessFunction — no match ---- */
+int test_fitness_no_match(void) {
+    int gv[] = {1, 1, 1, 1};
+    int tv[] = {-1, -1, -1, -1};
+    tf_genome_t genome = make_genome(gv, 4);
+    tf_genome_t target = make_genome(tv, 4);
+    double f = tf_fitness_match(&genome, &target, NULL);
+    ASSERT_FEQ(f, 0.0, 0.001);
     return 0;
 }
 
-int test_active_count() {
-    tf_strategy_t s = {.len = 5, .actions = {TF_CHOOSE, TF_AVOID, TF_CHOOSE, TF_UNKNOWN, TF_CHOOSE}};
-    assert(tf_strategy_active_count(&s) == 3);
+/* ---- Test 3: FitnessFunction — weighted ---- */
+int test_fitness_weighted(void) {
+    int gv[] = {1, -1, 0};
+    int tv[] = {1, -1, 0};
+    double w[] = {2.0, 3.0, 5.0};
+    tf_genome_t genome = make_genome(gv, 3);
+    tf_genome_t target = make_genome(tv, 3);
+    double f = tf_fitness_match(&genome, &target, w);
+    ASSERT_FEQ(f, 1.0, 0.001);
+
+    /* Partial match: first two match, third doesn't */
+    int tv2[] = {1, -1, 1};
+    target = make_genome(tv2, 3);
+    f = tf_fitness_match(&genome, &target, w);
+    ASSERT_FEQ(f, 5.0 / 10.0, 0.001); /* (2+3)/10 */
     return 0;
 }
 
-int test_active_count_zero() {
-    tf_strategy_t s = {.len = 3, .actions = {TF_AVOID, TF_UNKNOWN, TF_AVOID}};
-    assert(tf_strategy_active_count(&s) == 0);
+/* ---- Test 4: FitnessFunction — hamming fitness ---- */
+int test_fitness_hamming(void) {
+    int gv[] = {1, -1, 0, 1};
+    int tv[] = {1, 1, 0, -1};
+    tf_genome_t genome = make_genome(gv, 4);
+    tf_genome_t target = make_genome(tv, 4);
+    double f = tf_fitness_hamming(&genome, &target, NULL);
+    /* 2 matches out of 4 → hamming dist = 2 → 1 - 2/4 = 0.5 */
+    ASSERT_FEQ(f, 0.5, 0.001);
     return 0;
 }
 
-int test_shannon_entropy_uniform() {
-    tf_strategy_t s = {.len = 9};
-    for (int i = 0; i < 9; i++) {
-        s.actions[i] = (tf_action_t)((i % 3) - 1);
-    }
-    double h = tf_shannon_entropy(&s);
-    ASSERT_FEQ(h, log2(3.0), 0.01);
+/* ---- Test 5: PopulationFitness — basic stats ---- */
+int test_population_fitness_stats(void) {
+    int tv[] = {1, 1, 1};
+    tf_genome_t target = make_genome(tv, 3);
+
+    int g0[] = {1, 1, 1};  /* perfect: 1.0 */
+    int g1[] = {-1, -1, -1}; /* none: 0.0 */
+    int g2[] = {1, -1, 1};  /* 2/3 ≈ 0.667 */
+
+    tf_genome_t pop[3];
+    pop[0] = make_genome(g0, 3);
+    pop[1] = make_genome(g1, 3);
+    pop[2] = make_genome(g2, 3);
+
+    tf_pop_fitness_t pf;
+    tf_population_fitness(pop, 3, &target, NULL, tf_fitness_match, &pf);
+
+    ASSERT(pf.count == 3);
+    ASSERT_FEQ(pf.max, 1.0, 0.001);
+    ASSERT_FEQ(pf.min, 0.0, 0.001);
+    ASSERT_FEQ(pf.mean, (1.0 + 0.0 + 2.0/3.0) / 3.0, 0.01);
+    ASSERT(pf.best_idx == 0);
+    ASSERT(pf.worst_idx == 1);
     return 0;
 }
 
-int test_shannon_entropy_pure() {
-    tf_strategy_t s = {.len = 5};
-    for (int i = 0; i < 5; i++) s.actions[i] = TF_CHOOSE;
-    double h = tf_shannon_entropy(&s);
-    ASSERT_FEQ(h, 0.0, 0.001);
+/* ---- Test 6: PopulationFitness — single individual ---- */
+int test_population_single(void) {
+    int tv[] = {1, 0, -1};
+    tf_genome_t target = make_genome(tv, 3);
+    tf_genome_t pop[1];
+    pop[0] = make_genome(tv, 3);
+
+    tf_pop_fitness_t pf;
+    tf_population_fitness(pop, 1, &target, NULL, tf_fitness_match, &pf);
+
+    ASSERT(pf.count == 1);
+    ASSERT_FEQ(pf.max, 1.0, 0.001);
+    ASSERT_FEQ(pf.min, 1.0, 0.001);
+    ASSERT_FEQ(pf.mean, 1.0, 0.001);
     return 0;
 }
 
-int test_normalized_entropy() {
-    tf_strategy_t s = {.len = 9};
-    for (int i = 0; i < 9; i++) s.actions[i] = (tf_action_t)((i % 3) - 1);
-    double h = tf_normalized_entropy(&s);
-    ASSERT_FEQ(h, 1.0, 0.01);
+/* ---- Test 7: FitnessLandscape — peak boosts nearby genome ---- */
+int test_landscape_peak(void) {
+    int tv[] = {1, 1, 1, 1};
+    tf_genome_t target = make_genome(tv, 4);
+
+    int pv[] = {1, 1, 1, 1};
+    tf_genome_t peak_genome = make_genome(pv, 4);
+
+    tf_landscape_t land;
+    tf_landscape_init(&land);
+    tf_landscape_add_peak(&land, &peak_genome, 2.0, 2.0);
+
+    /* Genome exactly on peak */
+    tf_genome_t g = make_genome(pv, 4);
+    double f = tf_landscape_fitness(&land, &g, &target, NULL);
+    ASSERT(f > 1.0); /* base(1.0) + peak bonus → > 1 */
+    ASSERT_FEQ(f, 3.0, 0.01); /* 1.0 + 2.0 * exp(0) = 3.0 */
     return 0;
 }
 
-int test_hamming_distance_same() {
-    tf_strategy_t a = {.len = 4, .actions = {TF_AVOID, TF_UNKNOWN, TF_CHOOSE, TF_AVOID}};
-    tf_strategy_t b = {.len = 4, .actions = {TF_AVOID, TF_UNKNOWN, TF_CHOOSE, TF_AVOID}};
-    ASSERT_FEQ(tf_hamming_distance(&a, &b), 0.0, 0.001);
+/* ---- Test 8: FitnessLandscape — valley penalizes nearby genome ---- */
+int test_landscape_valley(void) {
+    int tv[] = {1, 1, 1, 1};
+    tf_genome_t target = make_genome(tv, 4);
+
+    int vv[] = {1, 1, 1, 1};
+    tf_genome_t valley_genome = make_genome(vv, 4);
+
+    tf_landscape_t land;
+    tf_landscape_init(&land);
+    tf_landscape_add_valley(&land, &valley_genome, 1.5, 2.0);
+
+    tf_genome_t g = make_genome(vv, 4);
+    double f = tf_landscape_fitness(&land, &g, &target, NULL);
+    /* base(1.0) - valley penalty → 1.0 - 1.5 = -0.5 */
+    ASSERT_FEQ(f, -0.5, 0.01);
     return 0;
 }
 
-int test_hamming_distance_different() {
-    tf_strategy_t a = {.len = 4, .actions = {TF_AVOID, TF_UNKNOWN, TF_CHOOSE, TF_AVOID}};
-    tf_strategy_t b = {.len = 4, .actions = {TF_CHOOSE, TF_CHOOSE, TF_AVOID, TF_AVOID}};
-    ASSERT_FEQ(tf_hamming_distance(&a, &b), 3.0, 0.001);
+/* ---- Test 9: FitnessLandscape — peak + valley combined ---- */
+int test_landscape_combined(void) {
+    int tv[] = {1, 1, 1, 1};
+    tf_genome_t target = make_genome(tv, 4);
+
+    int pv[] = {-1, -1, -1, -1};
+    tf_genome_t peak_g = make_genome(pv, 4);
+
+    int vv[] = {1, 0, 1, 0};
+    tf_genome_t valley_g = make_genome(vv, 4);
+
+    tf_landscape_t land;
+    tf_landscape_init(&land);
+    tf_landscape_add_peak(&land, &peak_g, 3.0, 3.0);
+    tf_landscape_add_valley(&land, &valley_g, 2.0, 1.0);
+
+    /* Genome at peak: match=0, peak bonus = 3.0, valley: far enough for small penalty */
+    tf_genome_t g = make_genome(pv, 4);
+    double f = tf_landscape_fitness(&land, &g, &target, NULL);
+    /* base=0, peak=3.0*exp(0)=3.0, valley: hamming=3 → penalty=2*exp(-9/2)≈0.022 */
+    ASSERT(f > 2.9);
     return 0;
 }
 
-int test_hamming_distance_different_length() {
-    tf_strategy_t a = {.len = 3, .actions = {TF_AVOID, TF_UNKNOWN, TF_CHOOSE}};
-    tf_strategy_t b = {.len = 5, .actions = {TF_AVOID, TF_UNKNOWN, TF_CHOOSE, TF_AVOID, TF_CHOOSE}};
-    ASSERT_FEQ(tf_hamming_distance(&a, &b), 2.0, 0.001);
+/* ---- Test 10: SelectionPressure — rank-based ---- */
+int test_pressure_rank(void) {
+    tf_pop_fitness_t pf;
+    pf.count = 4;
+    pf.fitnesses[0] = 0.9;
+    pf.fitnesses[1] = 0.3;
+    pf.fitnesses[2] = 0.7;
+    pf.fitnesses[3] = 0.5;
+    pf.mean = 0.6;
+
+    tf_selection_pressure_t sp = {TF_PRESSURE_RANK, 2.0};
+    double scaled[4];
+    double sum = tf_apply_pressure(&pf, sp, scaled);
+
+    /* Rank 0 (best=idx0) gets 2.0, rank 3 (worst=idx1) gets 1.0 */
+    ASSERT_FEQ(scaled[0], 2.0, 0.001);     /* fitness 0.9 → rank 0 → 2.0 */
+    ASSERT_FEQ(scaled[1], 1.0, 0.001);     /* fitness 0.3 → rank 3 → 1.0 */
+    ASSERT(sum > 0.0);
     return 0;
 }
 
-int test_exhaustive_81() {
-    /* 3^4 = 81 strategies */
-    tf_environment_t env = {.n_states = 4};
-    for (int i = 0; i < 4; i++) {
-        env.rewards[i][0] = -1.0;
-        env.rewards[i][1] = 0.0;
-        env.rewards[i][2] = 1.0;
-    }
-    tf_search_result_t result;
-    size_t count = tf_exhaustive_search(4, &env, &result);
-    assert(count == 81);
-    
-    tf_strategy_t best;
-    double best_fitness;
-    assert(tf_find_best(&result, &best, &best_fitness));
-    ASSERT_FEQ(best_fitness, 4.0, 0.001); /* all CHOOSE */
+/* ---- Test 11: SelectionPressure — exponential ---- */
+int test_pressure_exponential(void) {
+    tf_pop_fitness_t pf;
+    pf.count = 3;
+    pf.fitnesses[0] = 1.0;
+    pf.fitnesses[1] = 0.5;
+    pf.fitnesses[2] = 0.0;
+    pf.mean = 0.5;
+
+    tf_selection_pressure_t sp = {TF_PRESSURE_EXPONENTIAL, 2.0};
+    double scaled[3];
+    tf_apply_pressure(&pf, sp, scaled);
+
+    ASSERT(scaled[0] > scaled[1]);
+    ASSERT(scaled[1] > scaled[2]);
+    ASSERT_FEQ(scaled[0], exp(2.0), 0.01);
+    ASSERT_FEQ(scaled[2], exp(0.0), 0.01);
     return 0;
 }
 
-int test_exhaustive_best() {
-    tf_environment_t env = {.n_states = 3};
-    /* Non-uniform rewards: make AVOID best for state 0 */
-    env.rewards[0][0] = 2.0;  /* avoid */
-    env.rewards[0][1] = 0.0;
-    env.rewards[0][2] = -1.0;
-    env.rewards[1][0] = -1.0;
-    env.rewards[1][1] = 0.0;
-    env.rewards[1][2] = 1.0;
-    env.rewards[2][0] = -1.0;
-    env.rewards[2][1] = 3.0;  /* unknown is best */
-    env.rewards[2][2] = 1.0;
-    
-    tf_search_result_t result;
-    tf_exhaustive_search(3, &env, &result);
-    assert(result.count == 27);
-    
-    tf_strategy_t best;
-    double best_fitness;
-    assert(tf_find_best(&result, &best, &best_fitness));
-    ASSERT_FEQ(best_fitness, 6.0, 0.001); /* 2 + 1 + 3 */
-    assert(best.actions[0] == TF_AVOID);
-    assert(best.actions[1] == TF_CHOOSE);
-    assert(best.actions[2] == TF_UNKNOWN);
+/* ---- Test 12: SelectionPressure — sigma scaling ---- */
+int test_pressure_sigma(void) {
+    tf_pop_fitness_t pf;
+    pf.count = 3;
+    pf.fitnesses[0] = 1.0;
+    pf.fitnesses[1] = 0.5;
+    pf.fitnesses[2] = 0.0;
+    pf.mean = 0.5;
+
+    tf_selection_pressure_t sp = {TF_PRESSURE_SIGMA, 0.0};
+    double scaled[3];
+    tf_apply_pressure(&pf, sp, scaled);
+
+    /* mean=0.5, var=((0.5^2)+(0^2)+(0.5^2))/3=0.1667, stddev≈0.408 */
+    /* Above mean gets >1, below gets <1 */
+    ASSERT(scaled[0] > 1.0);
+    ASSERT(scaled[2] < 1.0);
     return 0;
 }
 
-int test_landscape_analysis() {
-    tf_environment_t env = {.n_states = 3};
-    for (int i = 0; i < 3; i++) {
-        env.rewards[i][0] = -1.0;
-        env.rewards[i][1] = 0.0;
-        env.rewards[i][2] = 1.0;
-    }
-    tf_search_result_t result;
-    tf_exhaustive_search(3, &env, &result);
-    
-    tf_landscape_info_t info = tf_analyze_landscape(&result);
-    ASSERT_FEQ(info.max_fitness, 3.0, 0.001);
-    ASSERT_FEQ(info.min_fitness, -3.0, 0.001);
-    ASSERT_FEQ(info.mean_fitness, 0.0, 0.001);
-    assert(info.n_peaks > 0);
+/* ---- Test 13: SelectionPressure — power ---- */
+int test_pressure_power(void) {
+    tf_pop_fitness_t pf;
+    pf.count = 2;
+    pf.fitnesses[0] = 0.5;
+    pf.fitnesses[1] = 0.9;
+    pf.mean = 0.7;
+
+    tf_selection_pressure_t sp = {TF_PRESSURE_POWER, 2.0};
+    double scaled[2];
+    tf_apply_pressure(&pf, sp, scaled);
+
+    ASSERT_FEQ(scaled[0], 0.25, 0.001);   /* 0.5^2 */
+    ASSERT_FEQ(scaled[1], 0.81, 0.001);   /* 0.9^2 */
     return 0;
 }
 
-int test_population_diversity_single() {
-    tf_strategy_t pop[1];
-    pop[0].len = 3;
-    pop[0].actions[0] = TF_CHOOSE;
-    pop[0].actions[1] = TF_AVOID;
-    pop[0].actions[2] = TF_UNKNOWN;
-    ASSERT_FEQ(tf_population_diversity(pop, 1), 0.0, 0.001);
+/* ---- Test 14: Elitism — select top 3 from 5 ---- */
+int test_elitism_basic(void) {
+    int tv[] = {1, 1, 1};
+    tf_genome_t target = make_genome(tv, 3);
+
+    tf_genome_t pop[5];
+    int g0[] = {1, 1, 1};   /* match 1.0 */
+    int g1[] = {-1, -1, -1}; /* 0.0 */
+    int g2[] = {1, -1, 1};   /* 2/3 */
+    int g3[] = {0, 1, 1};    /* 2/3 */
+    int g4[] = {1, 0, 0};    /* 1/3 */
+
+    pop[0] = make_genome(g0, 3);
+    pop[1] = make_genome(g1, 3);
+    pop[2] = make_genome(g2, 3);
+    pop[3] = make_genome(g3, 3);
+    pop[4] = make_genome(g4, 3);
+
+    tf_pop_fitness_t pf;
+    tf_population_fitness(pop, 5, &target, NULL, tf_fitness_match, &pf);
+
+    tf_genome_t elite[3];
+    double elite_f[3];
+    size_t n = tf_elitism(&pf, pop, 5, 3, elite, elite_f);
+
+    ASSERT(n == 3);
+    ASSERT_FEQ(elite_f[0], 1.0, 0.001);
+    /* The top 3 by fitness: 1.0, 2/3, 2/3 */
+    ASSERT(elite_f[1] >= elite_f[2]);
     return 0;
 }
 
-int test_population_diversity_identical() {
-    tf_strategy_t pop[3];
-    for (int i = 0; i < 3; i++) {
-        pop[i].len = 3;
-        pop[i].actions[0] = TF_CHOOSE;
-        pop[i].actions[1] = TF_AVOID;
-        pop[i].actions[2] = TF_UNKNOWN;
-    }
-    ASSERT_FEQ(tf_population_diversity(pop, 3), 0.0, 0.001);
+/* ---- Test 15: Elitism — n_elite > pop_size ---- */
+int test_elitism_too_many(void) {
+    int tv[] = {1};
+    tf_genome_t target = make_genome(tv, 1);
+
+    tf_genome_t pop[2];
+    pop[0] = make_genome((int[]){1}, 1);
+    pop[1] = make_genome((int[]){-1}, 1);
+
+    tf_pop_fitness_t pf;
+    tf_population_fitness(pop, 2, &target, NULL, tf_fitness_match, &pf);
+
+    tf_genome_t elite[5];
+    size_t n = tf_elitism(&pf, pop, 2, 5, elite, NULL);
+    ASSERT(n == 2); /* capped at pop_size */
     return 0;
 }
 
-int test_population_diversity_diverse() {
-    tf_strategy_t pop[3];
-    pop[0] = (tf_strategy_t){.len = 3, .actions = {TF_AVOID, TF_AVOID, TF_AVOID}};
-    pop[1] = (tf_strategy_t){.len = 3, .actions = {TF_CHOOSE, TF_CHOOSE, TF_CHOOSE}};
-    pop[2] = (tf_strategy_t){.len = 3, .actions = {TF_UNKNOWN, TF_UNKNOWN, TF_UNKNOWN}};
-    double div = tf_population_diversity(pop, 3);
-    assert(div > 0.0);
-    /* 3 pairs, each distance = 3 */
-    ASSERT_FEQ(div, 3.0, 0.001);
+/* ---- Test 16: sort_by_fitness ---- */
+int test_sort_by_fitness(void) {
+    tf_pop_fitness_t pf;
+    pf.count = 4;
+    pf.fitnesses[0] = 0.2;
+    pf.fitnesses[1] = 0.8;
+    pf.fitnesses[2] = 0.5;
+    pf.fitnesses[3] = 0.1;
+
+    size_t indices[4];
+    tf_sort_by_fitness(&pf, indices, 4);
+
+    ASSERT(indices[0] == 1); /* 0.8 */
+    ASSERT(indices[1] == 2); /* 0.5 */
+    ASSERT(indices[2] == 0); /* 0.2 */
+    ASSERT(indices[3] == 3); /* 0.1 */
     return 0;
 }
 
-int test_entropy_two_values() {
-    tf_strategy_t s = {.len = 4, .actions = {TF_AVOID, TF_AVOID, TF_CHOOSE, TF_CHOOSE}};
-    double h = tf_shannon_entropy(&s);
-    ASSERT_FEQ(h, 1.0, 0.01); /* log2(2) = 1 */
+/* ---- Test 17: Landscape — no peaks/valleys = base fitness ---- */
+int test_landscape_plain(void) {
+    int tv[] = {1, -1, 0};
+    tf_genome_t target = make_genome(tv, 3);
+
+    tf_landscape_t land;
+    tf_landscape_init(&land);
+
+    int gv[] = {1, -1, 0};
+    tf_genome_t g = make_genome(gv, 3);
+    double f = tf_landscape_fitness(&land, &g, &target, NULL);
+    ASSERT_FEQ(f, 1.0, 0.001); /* just base fitness */
+    return 0;
+}
+
+/* ---- Test 18: Empty genome fitness ---- */
+int test_empty_genome(void) {
+    tf_genome_t g = {.len = 0};
+    tf_genome_t t = {.len = 0};
+    double f = tf_fitness_match(&g, &t, NULL);
+    ASSERT_FEQ(f, 0.0, 0.001);
     return 0;
 }
 
@@ -209,27 +363,29 @@ int main(void) {
         if (r == 0) printf("  PASS: %s\n", #name); \
         else { printf("  FAIL: %s\n", #name); failures++; } \
     } while(0)
-    
-    printf("Running tests...\n");
-    RUN(strategy_fitness);
-    RUN(strategy_fitness_mixed);
-    RUN(active_count);
-    RUN(active_count_zero);
-    RUN(shannon_entropy_uniform);
-    RUN(shannon_entropy_pure);
-    RUN(normalized_entropy);
-    RUN(hamming_distance_same);
-    RUN(hamming_distance_different);
-    RUN(hamming_distance_different_length);
-    RUN(exhaustive_81);
-    RUN(exhaustive_best);
-    RUN(landscape_analysis);
-    RUN(population_diversity_single);
-    RUN(population_diversity_identical);
-    RUN(population_diversity_diverse);
-    RUN(entropy_two_values);
-    
-    int n = 17;
-    printf("\n%d/%d passed\n", n - failures, n);
+
+    printf("Running ternary-fitness-c tests...\n\n");
+
+    RUN(fitness_perfect_match);
+    RUN(fitness_no_match);
+    RUN(fitness_weighted);
+    RUN(fitness_hamming);
+    RUN(population_fitness_stats);
+    RUN(population_single);
+    RUN(landscape_peak);
+    RUN(landscape_valley);
+    RUN(landscape_combined);
+    RUN(pressure_rank);
+    RUN(pressure_exponential);
+    RUN(pressure_sigma);
+    RUN(pressure_power);
+    RUN(elitism_basic);
+    RUN(elitism_too_many);
+    RUN(sort_by_fitness);
+    RUN(landscape_plain);
+    RUN(empty_genome);
+
+    int total = 18;
+    printf("\n%d/%d passed\n", total - failures, total);
     return failures;
 }
