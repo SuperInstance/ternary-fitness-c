@@ -3,3 +3,5 @@ test_fitness
 .env
 credentials.*
 *.secret
+target/
+Cargo.lock
